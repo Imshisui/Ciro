@@ -104,10 +104,12 @@ install_apt_package() {
     log_info "Pacote '$package' já instalado."
   else
     log_info "Instalando pacote: $package"
-    run_as_root apt-get install -y -qq \
+    if ! run_as_root apt-get install -y -qq \
       -o Dpkg::Options::="--force-confdef" \
       -o Dpkg::Options::="--force-confold" \
-      --no-install-recommends "$package"
+      --no-install-recommends "$package"; then
+      log_warn "Falha ao instalar pacote '$package' (apt retornou $?); prosseguindo sem abortar."
+    fi
   fi
 }
 
@@ -130,8 +132,70 @@ download_file() {
 }
 
 phase_system_prep() {
-  log_info "Atualizando apt..."
-  run_as_root apt-get update -y -qq
+  log_info "Preparando sistema: atualizando apt e garantindo chaves GPG (ex: yarn)..."
+
+  # Desative temporariamente repositórios problemáticos (yarn) antes do primeiro 'apt-get update'
+  local yarn_list="/etc/apt/sources.list.d/yarn.list"
+  local yarn_disabled="/etc/apt/sources.list.d/yarn.list.disabled"
+  local yarn_was_disabled=0
+  if [ -f "$yarn_list" ]; then
+    log_info "Desativando temporariamente $yarn_list para evitar falhas GPG..."
+    run_as_root mv -f "$yarn_list" "$yarn_disabled" || true
+    yarn_was_disabled=1
+  fi
+
+  log_info "Atualizando apt (cache inicial)..."
+  run_as_root apt-get update -y -qq || true
+
+  # Instala pacotes necessários para importar chaves (gnupg, ca-certificates)
+  install_apt_package "ca-certificates"
+  install_apt_package "gnupg"
+
+  run_as_root mkdir -p /etc/apt/keyrings /usr/share/keyrings || true
+
+  # Se houver qualquer referência ao repositório yarn, importe sua chave pública agora que gpg está disponível
+  if grep -R "dl.yarnpkg.com" /etc/apt 2>/dev/null >/dev/null; then
+    log_info "Repositório yarn detectado em /etc/apt, importando chave pública..."
+    if command -v gpg >/dev/null 2>&1; then
+      # remove chaves antigas que possam causar prompt interativo
+      run_as_root rm -f /etc/apt/keyrings/yarn.gpg /usr/share/keyrings/yarn-archive-keyring.gpg /etc/apt/trusted.gpg.d/yarn-archive-keyring.gpg || true
+      if curl -fsSL https://dl.yarnpkg.com/debian/pubkey.gpg | run_as_root gpg --batch --yes --dearmor -o /etc/apt/keyrings/yarn.gpg; then
+        log_info "Chave do yarn importada para /etc/apt/keyrings/yarn.gpg"
+      else
+        log_warn "Não consegui importar a chave do yarn para /etc/apt/keyrings."
+      fi
+
+      if curl -fsSL https://dl.yarnpkg.com/debian/pubkey.gpg | run_as_root gpg --batch --yes --dearmor -o /usr/share/keyrings/yarn-archive-keyring.gpg; then
+        log_info "Chave do yarn importada para /usr/share/keyrings/yarn-archive-keyring.gpg"
+        # Copia para trusted.gpg.d como fallback para apt aceitar o repositório
+        run_as_root mkdir -p /etc/apt/trusted.gpg.d || true
+        run_as_root cp -f /usr/share/keyrings/yarn-archive-keyring.gpg /etc/apt/trusted.gpg.d/yarn-archive-keyring.gpg || true
+        log_info "Chave do yarn copiada para /etc/apt/trusted.gpg.d (fallback)"
+      else
+        log_warn "Não consegui importar a chave do yarn para /usr/share/keyrings."
+      fi
+    else
+      # Fallback caso gpg não esteja disponível (muito raro após instalar gnupg)
+      if command -v apt-key >/dev/null 2>&1; then
+        if curl -fsSL https://dl.yarnpkg.com/debian/pubkey.gpg | run_as_root apt-key add - >/dev/null 2>&1; then
+          log_info "Chave do yarn adicionada via apt-key (fallback)."
+        else
+          log_warn "Falha ao adicionar chave do yarn via apt-key."
+        fi
+      else
+        log_warn "gpg e apt-key não disponíveis; não importei chave do yarn."
+      fi
+    fi
+  fi
+
+  # Reativar arquivo do yarn se desativado
+  if [ "${yarn_was_disabled:-0}" -eq 1 ]; then
+    log_info "Reativando $yarn_disabled -> $yarn_list"
+    run_as_root mv -f "$yarn_disabled" "$yarn_list" || true
+  fi
+
+  # Atualiza o cache novamente para aplicar novas chaves e fontes
+  run_as_root apt-get update -y -qq || true
 
   log_info "Instalando dependências essenciais..."
   local basic_packages=(
@@ -175,6 +239,11 @@ phase_system_prep() {
     install_apt_package "$pkg"
   done
 }
+  # Reativar arquivo do yarn se desativado
+  if [ "${yarn_was_disabled:-0}" -eq 1 ]; then
+    log_info "Reativando $yarn_disabled -> $yarn_list"
+    run_as_root mv -f "$yarn_disabled" "$yarn_list" || true
+  fi
 
 phase_nodejs() {
   log_info "Verificando Node.js..."
@@ -298,12 +367,22 @@ phase_android_sdk() {
   local sdkmanager_bin="$ANDROID_SDK_DIR/cmdline-tools/latest/bin/sdkmanager"
 
   log_info "Instalando Android packages (platform/build-tools/ndk/cmake)..."
+  # sdkmanager às vezes falha em ambientes restritos; tentar e não abortar o script
+  # desabilita temporariamente o trap ERR para que falhas do sdkmanager não parem o script
+  trap '' ERR
+  set +e
   yes | run_as_user "$sdkmanager_bin" --install \
     "platform-tools" \
     "platforms;android-${ANDROID_API}" \
     "build-tools;${BUILD_TOOLS}" \
     "ndk;${NDK_VERSION}" \
-    "cmake;${CMAKE_VERSION}" >/dev/null
+    "cmake;${CMAKE_VERSION}" >/dev/null 2>&1
+  local sdk_ret=$?
+  set -e
+  trap 'on_error' ERR
+  if [ $sdk_ret -ne 0 ]; then
+    log_warn "sdkmanager terminou com código $sdk_ret — continuará, mas pacotes Android podem não ter sido instalados. Verifique $ANDROID_SDK_DIR/cmdline-tools/latest/bin/sdkmanager manualmente."
+  fi
 }
 
 # Flutter (não-interativo, SDK oficial)
@@ -437,6 +516,27 @@ phase_docker() {
 
 phase_vscode() {
   log_info "Verificando VS Code..."
+  # Se SKIP_VSCODE_EXT=1, gere um script com os comandos para instalar extensões manualmente
+  if [ "${SKIP_VSCODE_EXT:-0}" = "1" ]; then
+    log_info "SKIP_VSCODE_EXT=1 definido — gerando script com comandos das extensões e pulando instalação automática."
+    local manual_script="$USER_HOME/install_vscode_extensions_manual.sh"
+    run_as_user rm -f "$manual_script" || true
+    run_as_user touch "$manual_script"
+    run_as_user chmod +x "$manual_script"
+    run_as_user bash -c "cat > '$manual_script' <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+echo 'Script gerado para instalar extensões do VS Code manualmente.'
+echo 'Execute este script como seu usuário (não como root) para instalar as extensões.'
+
+BASH"
+    for ext in "${extensions[@]}"; do
+      # escreve comando sem executar
+      run_as_user bash -c "echo \"code --install-extension '$ext' --force || echo 'Falha ao instalar $ext'\" >> '$manual_script'"
+    done
+    log_info "Script de instalação manual das extensões criado em: $manual_script"
+    return 0
+  fi
   if ! command -v code >/dev/null 2>&1; then
     log_info "Instalando VS Code..."
     install_apt_package "apt-transport-https"
